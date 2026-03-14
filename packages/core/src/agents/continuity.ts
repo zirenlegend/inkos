@@ -61,10 +61,32 @@ function buildDimensionList(
 ): ReadonlyArray<{ readonly id: number; readonly name: string; readonly note: string }> {
   const activeIds = new Set(gp.auditDimensions);
 
-  // Add book-level additional dimensions
+  // Add book-level additional dimensions (supports both numeric IDs and name strings)
   if (bookRules?.additionalAuditDimensions) {
+    // Build reverse lookup: name → id
+    const nameToId = new Map<string, number>();
+    for (const [id, name] of Object.entries(DIMENSION_MAP)) {
+      nameToId.set(name, Number(id));
+    }
+
     for (const d of bookRules.additionalAuditDimensions) {
-      if (typeof d === "number") activeIds.add(d);
+      if (typeof d === "number") {
+        activeIds.add(d);
+      } else if (typeof d === "string") {
+        // Try exact match first, then substring match
+        const exactId = nameToId.get(d);
+        if (exactId !== undefined) {
+          activeIds.add(exactId);
+        } else {
+          // Fuzzy: find dimension whose name contains the string
+          for (const [name, id] of nameToId) {
+            if (name.includes(d) || d.includes(name)) {
+              activeIds.add(id);
+              break;
+            }
+          }
+        }
+      }
     }
   }
 
