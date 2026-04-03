@@ -94,8 +94,8 @@ describe("WriterAgent repairChapter", () => {
         | undefined;
       const systemPrompt = messages?.[0]?.content ?? "";
 
-      expect(systemPrompt).toContain("MUST be in English");
-      expect(systemPrompt).toContain("written entirely in English");
+      expect(systemPrompt).toContain("MUST be written entirely in English");
+      expect(systemPrompt).toContain("You are a professional");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

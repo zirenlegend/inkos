@@ -350,10 +350,12 @@ ${finalRequirementsPrompt}`;
     book: BookConfig,
     chaptersText: string,
     externalContext?: string,
+    reviewFeedback?: string,
   ): Promise<ArchitectOutput> {
     const { profile: gp, body: genreBody } =
       await readGenreProfile(this.ctx.projectRoot, book.genre);
     const resolvedLanguage = book.language ?? gp.language;
+    const reviewFeedbackBlock = this.buildReviewFeedbackBlock(reviewFeedback, resolvedLanguage);
 
     const contextBlock = externalContext
       ? `\n\n## 外部指令\n${externalContext}\n`
@@ -524,13 +526,20 @@ ${eraBlock}`;
 
 ## 工作模式
 
-这不是从零创建，而是从已有正文中提取和推导。你需要：
+这不是从零创建，而是从已有正文中提取和推导，**并设计续写方向**。你需要：
 1. 从正文中提取世界观、势力、角色、力量体系 → 生成 story_bible
-2. 从叙事结构推断卷纲 → 生成 volume_outline（已有章节的回顾 + 预测后续方向）
+2. 从叙事结构推断卷纲 → 生成 volume_outline（已有章节的回顾 + **续写部分的新方向设计**）
 3. 从角色行为推断主角锁定和禁忌 → 生成 book_rules
 4. 从最新章节状态推断 current_state（反映最后一章结束时的状态）
 5. 从正文中识别已埋伏笔 → 生成 pending_hooks
 
+## 续写方向要求（关键）
+续写部分（volume_outline 中尚未发生的章节）必须设计**新的叙事空间**：
+1. **新冲突维度**：续写不能只是把导入章节的冲突继续拉长。必须引入至少一个原文未涉及的新冲突方向（新角色、新势力、新地点、新时间跨度）
+2. **5章内引爆**：续写的第一卷必须在前5章内建立新悬念，不允许用3章回顾已知信息
+3. **场景新鲜度**：续写部分至少50%的关键场景发生在导入章节未出现的地点或情境中
+4. **不重复会议**：如果导入章节以会议/讨论结束，续写必须从行动开始，不能再开一轮会
+${reviewFeedbackBlock}
 ## 书籍信息
 
 - 标题：${book.title}

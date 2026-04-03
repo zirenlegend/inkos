@@ -1869,7 +1869,14 @@ ${matrix}`,
         ).join("\n\n---\n\n");
 
         const architect = new ArchitectAgent(this.agentCtxFor("architect", input.bookId));
-        const foundation = await architect.generateFoundationFromImport(book, allText);
+        const reviewer = new FoundationReviewerAgent(this.agentCtxFor("foundation-reviewer", input.bookId));
+        const foundation = await this.generateAndReviewFoundation({
+          generate: (reviewFeedback) => architect.generateFoundationFromImport(book, allText, undefined, reviewFeedback),
+          reviewer,
+          mode: "series",
+          language: resolvedLanguage === "en" ? "en" : "zh",
+          stageLanguage: resolvedLanguage,
+        });
         await architect.writeFoundationFiles(
           bookDir,
           foundation,
