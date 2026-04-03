@@ -2697,8 +2697,8 @@ ${matrix}`,
       params.book.genre,
       params.auditOptions,
     );
-    const aiTells = analyzeAITells(params.chapterContent);
-    const sensitiveResult = analyzeSensitiveWords(params.chapterContent);
+    const aiTells = analyzeAITells(params.chapterContent, params.language);
+    const sensitiveResult = analyzeSensitiveWords(params.chapterContent, undefined, params.language);
     const longSpanFatigue = await analyzeLongSpanFatigue({
       bookDir: params.bookDir,
       chapterNumber: params.chapterNumber,

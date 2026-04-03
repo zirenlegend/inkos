@@ -87,4 +87,21 @@ describe("analyzeAITells", () => {
     const warningIssues = result.issues.filter((i) => i.severity === "warning");
     expect(warningIssues).toHaveLength(0);
   });
+
+  it("localizes issue text for English repair chains", () => {
+    const content = [
+      "The tower shook, however the captain did not move.",
+      "",
+      "The gate failed, however the lantern stayed lit.",
+      "",
+      "The bridge splintered, however the scouts kept running.",
+    ].join("\n");
+
+    const result = analyzeAITells(content, "en");
+    const transitionIssue = result.issues.find((i) => i.category === "Formulaic transitions");
+
+    expect(transitionIssue).toBeDefined();
+    expect(transitionIssue?.description).toContain("however");
+    expect(transitionIssue?.suggestion).toContain("transitions");
+  });
 });

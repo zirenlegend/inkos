@@ -2858,6 +2858,78 @@ describe("PipelineRunner", () => {
     }
   });
 
+  it("reviews imported foundations in series mode and feeds rejection feedback into regeneration", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    const chapterContent = "章节正文。".repeat(120);
+    const reviewMock = vi.mocked(FoundationReviewerAgent.prototype.review);
+    const generateFoundationFromImport = vi.spyOn(ArchitectAgent.prototype, "generateFoundationFromImport");
+
+    reviewMock.mockReset();
+    reviewMock
+      .mockResolvedValueOnce({
+        passed: false,
+        totalScore: 68,
+        dimensions: [
+          {
+            name: "新叙事空间",
+            score: 55,
+            feedback: "续写方向还是太贴近导入章节，需要明确打开新的叙事空间。",
+          },
+        ],
+        overallFeedback: "请把续写方向从旧冲突延长改成新的行动线。",
+      })
+      .mockResolvedValueOnce({
+        passed: true,
+        totalScore: 86,
+        dimensions: [],
+        overallFeedback: "通过",
+      });
+
+    generateFoundationFromImport.mockResolvedValue({
+      storyBible: "# Story Bible\n",
+      volumeOutline: "# Volume Outline\n",
+      bookRules: "---\nversion: \"1.0\"\n---\n\n# Book Rules\n",
+      currentState: createStateCard({
+        chapter: 0,
+        location: "Ashen ferry crossing",
+        protagonistState: "Lin Yue still hides the oath token.",
+        goal: "Find the vanished mentor.",
+        conflict: "The mentor debt is still personal.",
+      }),
+      pendingHooks: "# Pending Hooks\n",
+    });
+    vi.spyOn(ChapterAnalyzerAgent.prototype, "analyzeChapter").mockResolvedValue(
+      createAnalyzedOutput({
+        chapterNumber: 1,
+        title: "Prelude",
+        content: chapterContent,
+        wordCount: chapterContent.length,
+      }),
+    );
+    vi.spyOn(WriterAgent.prototype, "saveChapter").mockResolvedValue(undefined);
+    vi.spyOn(WriterAgent.prototype, "saveNewTruthFiles").mockResolvedValue(undefined);
+
+    try {
+      const result = await runner.importChapters({
+        bookId,
+        chapters: [
+          { title: "Prelude", content: chapterContent },
+        ],
+      });
+
+      expect(result.importedCount).toBe(1);
+      expect(reviewMock).toHaveBeenCalledTimes(2);
+      expect(reviewMock.mock.calls[0]?.[0]).toEqual(expect.objectContaining({ mode: "series" }));
+      expect(generateFoundationFromImport).toHaveBeenCalledTimes(2);
+      expect(generateFoundationFromImport.mock.calls[0]?.[3]).toBeUndefined();
+      expect(generateFoundationFromImport.mock.calls[1]?.[3]).toContain("请把续写方向从旧冲突延长改成新的行动线。");
+      expect(generateFoundationFromImport.mock.calls[1]?.[3]).toContain("新叙事空间");
+      expect((await state.loadChapterIndex(bookId))[0]?.status).toBe("imported");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   sqliteIt("rebuilds fact history from imported chapter snapshots", async () => {
     const { root, runner, state, bookId } = await createRunnerFixture();
 

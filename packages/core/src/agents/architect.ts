@@ -358,20 +358,29 @@ ${finalRequirementsPrompt}`;
     const reviewFeedbackBlock = this.buildReviewFeedbackBlock(reviewFeedback, resolvedLanguage);
 
     const contextBlock = externalContext
-      ? `\n\n## 外部指令\n${externalContext}\n`
+      ? (resolvedLanguage === "en"
+          ? `\n\n## External Instructions\n${externalContext}\n`
+          : `\n\n## 外部指令\n${externalContext}\n`)
       : "";
 
     const numericalBlock = gp.numericalSystem
-      ? `- 有明确的数值/资源体系可追踪
-- 在 book_rules 中定义 numericalSystemOverrides（hardCap、resourceTypes）`
-      : "- 本题材无数值系统，不需要资源账本";
+      ? (resolvedLanguage === "en"
+          ? `- The story uses a trackable numerical/resource system
+- Define numericalSystemOverrides in book_rules (hardCap, resourceTypes)`
+          : `- 有明确的数值/资源体系可追踪
+- 在 book_rules 中定义 numericalSystemOverrides（hardCap、resourceTypes）`)
+      : (resolvedLanguage === "en"
+          ? "- This genre has no explicit numerical system and does not need a resource ledger"
+          : "- 本题材无数值系统，不需要资源账本");
 
     const powerBlock = gp.powerScaling
-      ? "- 有明确的战力等级体系"
+      ? (resolvedLanguage === "en" ? "- The story has an explicit power-scaling ladder" : "- 有明确的战力等级体系")
       : "";
 
     const eraBlock = gp.eraResearch
-      ? "- 需要年代考据支撑（在 book_rules 中设置 eraConstraints）"
+      ? (resolvedLanguage === "en"
+          ? "- The story needs era/historical grounding (set eraConstraints in book_rules)"
+          : "- 需要年代考据支撑（在 book_rules 中设置 eraConstraints）")
       : "";
 
     const storyBiblePrompt = resolvedLanguage === "en"
@@ -522,7 +531,60 @@ ${numericalBlock}
 ${powerBlock}
 ${eraBlock}`;
 
-    const systemPrompt = `你是一个专业的网络小说架构师。你的任务是从已有的小说正文中反向推导完整的基础设定。${contextBlock}
+    const systemPrompt = resolvedLanguage === "en"
+      ? `You are a professional web-fiction architect. Your task is to reverse-engineer a complete foundation from existing chapters.${contextBlock}
+
+## Working Mode
+
+This is not a zero-to-one foundation pass. You must extract durable story truth from the imported chapters **and design a continuation path**. You need to:
+1. Extract worldbuilding, factions, characters, and systems from the source text -> generate story_bible
+2. Infer narrative structure and future arc direction -> generate volume_outline (review existing chapters + design a **new continuation direction**)
+3. Infer protagonist lock, prohibitions, and narrative constraints from character behavior -> generate book_rules
+4. Reflect the latest chapter state -> generate current_state
+5. Extract all active hooks already planted in the text -> generate pending_hooks
+
+All output sections — story_bible, volume_outline, book_rules, current_state, and pending_hooks — MUST be written in English. Keep the === SECTION: === tags unchanged.
+
+## Continuation Direction Requirements (Critical)
+The continuation portion (chapters in volume_outline that have not happened yet) must open up **new narrative space**:
+1. **New conflict dimension**: Do not merely stretch the imported conflict longer. Introduce at least one new conflict vector not yet covered by the source text (new character, new faction, new location, or new time horizon)
+2. **Ignite within 5 chapters**: The first continuation volume must establish a fresh suspense engine within 5 chapters. Do not spend 3 chapters recapping known information
+3. **Scene freshness**: At least 50% of key continuation scenes must happen in locations or situations not already used in the imported chapters
+4. **No repeated meeting rooms**: If the imported chapters end on a meeting/discussion beat, the continuation must restart from action instead of opening another meeting
+${reviewFeedbackBlock}
+## Book Metadata
+
+- Title: ${book.title}
+- Platform: ${book.platform}
+- Genre: ${gp.name} (${book.genre})
+- Target Chapters: ${book.targetChapters}
+- Chapter Target Length: ${book.chapterWordCount}
+
+## Genre Profile
+
+${genreBody}
+
+## Output Contract
+
+Generate the following sections. Separate every section with === SECTION: <name> ===:
+
+=== SECTION: story_bible ===
+${storyBiblePrompt}
+
+=== SECTION: volume_outline ===
+${volumeOutlinePrompt}
+
+=== SECTION: book_rules ===
+${bookRulesPrompt}
+
+=== SECTION: current_state ===
+${currentStatePrompt}
+
+=== SECTION: pending_hooks ===
+${pendingHooksPrompt}
+
+${keyPrinciplesPrompt}`
+      : `你是一个专业的网络小说架构师。你的任务是从已有的小说正文中反向推导完整的基础设定。${contextBlock}
 
 ## 工作模式
 
@@ -572,16 +634,12 @@ ${currentStatePrompt}
 ${pendingHooksPrompt}
 
 ${keyPrinciplesPrompt}`;
-
-    const langPrefix = resolvedLanguage === "en"
-      ? `【LANGUAGE OVERRIDE】ALL output (story_bible, volume_outline, book_rules, current_state, pending_hooks) MUST be written in English. Character names, place names, and all prose must be in English. The === SECTION: === tags remain unchanged.\n\n`
-      : "";
     const userMessage = resolvedLanguage === "en"
       ? `Generate the complete foundation for an imported ${gp.name} novel titled "${book.title}". Write everything in English.\n\n${chaptersText}`
       : `以下是《${book.title}》的全部已有正文，请从中反向推导完整基础设定：\n\n${chaptersText}`;
 
     const response = await this.chat([
-      { role: "system", content: langPrefix + systemPrompt },
+      { role: "system", content: systemPrompt },
       {
         role: "user",
         content: userMessage,

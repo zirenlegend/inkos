@@ -85,4 +85,14 @@ describe("analyzeSensitiveWords", () => {
     // Should have issues for both political and sexual/violence
     expect(result.issues.length).toBeGreaterThanOrEqual(2);
   });
+
+  it("localizes issue text for English repair chains", () => {
+    const content = "He saw Falun Gong slogans on the wall and paused.";
+    const result = analyzeSensitiveWords(content, ["Falun Gong"], "en");
+
+    expect(result.issues).toHaveLength(1);
+    expect(result.issues[0]?.category).toBe("Sensitive terms");
+    expect(result.issues[0]?.description).toContain("custom sensitive term");
+    expect(result.issues[0]?.suggestion).toContain("Replace or remove");
+  });
 });
