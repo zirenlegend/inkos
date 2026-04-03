@@ -41,7 +41,7 @@ import {
   retrySettlementAfterValidationFailure,
 } from "./chapter-state-recovery.js";
 import { persistChapterArtifacts } from "./chapter-persistence.js";
-import { runChapterReviewCycle } from "./chapter-review-cycle.js";
+import { runChapterReviewCycle, type ChapterRepairDecision } from "./chapter-review-cycle.js";
 import { validateChapterTruthPersistence } from "./chapter-truth-validation.js";
 import { loadPersistedPlan, relativeToBookDir } from "./persisted-governed-plan.js";
 
@@ -152,7 +152,8 @@ interface MergedAuditEvaluation {
   readonly aiTellCount: number;
   readonly blockingCount: number;
   readonly criticalCount: number;
-  readonly revisionBlockingIssues: ReadonlyArray<AuditIssue>;
+  readonly repairIssues: ReadonlyArray<AuditIssue>;
+  readonly repairDecision: ChapterRepairDecision;
 }
 
 export interface ImportChaptersInput {
@@ -1189,14 +1190,35 @@ export class PipelineRunner {
     // Token usage accumulator
     let totalUsage: TokenUsageSummary = output.tokenUsage ?? { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     const auditor = new ContinuityAuditor(this.agentCtxFor("auditor", bookId));
+    const initialRepairIssues: ReadonlyArray<AuditIssue> = output.postWriteErrors.map((violation) => ({
+      severity: "critical",
+      category: violation.rule,
+      description: violation.description,
+      suggestion: violation.suggestion,
+    }));
     const reviewResult = await runChapterReviewCycle({
-      book: { genre: book.genre },
-      bookDir,
-      chapterNumber,
-      initialOutput: output,
-      reducedControlInput,
+      initialOutput: {
+        content: output.content,
+        wordCount: output.wordCount,
+      },
+      initialRepairIssues,
       lengthSpec,
       initialUsage: totalUsage,
+      assessChapter: (chapterContent, options) => this.evaluateMergedAudit({
+        auditor,
+        book,
+        bookDir,
+        chapterContent,
+        chapterNumber,
+        language: pipelineLang,
+        auditOptions: reducedControlInput
+          ? {
+              ...reducedControlInput,
+              ...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
+            }
+          : (options?.temperature !== undefined ? { temperature: options.temperature } : undefined),
+        extraIssues: options?.initialRepairIssues,
+      }),
       repairChapter: (chapterContent, issues, mode) => writer.repairChapter({
         bookDir,
         chapterContent,
@@ -1209,7 +1231,6 @@ export class PipelineRunner {
         ruleStack: reducedControlInput?.ruleStack,
         lengthSpec,
       }),
-      auditor,
       normalizeDraftLengthIfNeeded: (chapterContent) => this.normalizeDraftLengthIfNeeded({
         bookId,
         chapterNumber,
@@ -1220,9 +1241,7 @@ export class PipelineRunner {
       assertChapterContentNotEmpty: (content, stage) =>
         this.assertChapterContentNotEmpty(content, chapterNumber, stage),
       addUsage: PipelineRunner.addUsage,
-      restoreLostAuditIssues: (previous, next) => this.restoreLostAuditIssues(previous, next),
-      analyzeAITells,
-      analyzeSensitiveWords,
+      restoreAssessment: (previous, next) => this.restoreActionableAuditIfLost(previous, next),
       logWarn: (message) => this.logWarn(pipelineLang, message),
       logStage: (message) => this.logStage(stageLanguage, message),
     });
@@ -2598,14 +2617,16 @@ ${matrix}`,
       aiTellCount: number;
       blockingCount: number;
       criticalCount: number;
-      revisionBlockingIssues: ReadonlyArray<AuditIssue>;
+      repairIssues: ReadonlyArray<AuditIssue>;
+      repairDecision: ChapterRepairDecision;
     },
     next: {
       auditResult: AuditResult;
       aiTellCount: number;
       blockingCount: number;
       criticalCount: number;
-      revisionBlockingIssues: ReadonlyArray<AuditIssue>;
+      repairIssues: ReadonlyArray<AuditIssue>;
+      repairDecision: ChapterRepairDecision;
     },
   ): MergedAuditEvaluation {
     const auditResult = this.restoreLostAuditIssues(previous.auditResult, next.auditResult);
@@ -2616,10 +2637,25 @@ ${matrix}`,
     return {
       ...next,
       auditResult,
-      revisionBlockingIssues: previous.revisionBlockingIssues,
+      repairIssues: previous.repairIssues,
       blockingCount: previous.blockingCount,
       criticalCount: previous.criticalCount,
+      repairDecision: previous.repairDecision,
     };
+  }
+
+  private deriveRepairDecision(params: {
+    passed: boolean;
+    llmIssues: ReadonlyArray<AuditIssue>;
+    blockingCount: number;
+    aiTellCount: number;
+  }): ChapterRepairDecision {
+    if (params.passed || (params.blockingCount === 0 && params.aiTellCount === 0)) {
+      return "none";
+    }
+
+    const hasCriticalAuditorIssue = params.llmIssues.some((issue) => issue.severity === "critical");
+    return hasCriticalAuditorIssue ? "rewrite" : "local-fix";
   }
 
   private async evaluateMergedAudit(params: {
@@ -2640,6 +2676,7 @@ ${matrix}`,
         hooks?: string;
       };
     };
+    extraIssues?: ReadonlyArray<AuditIssue>;
   }): Promise<MergedAuditEvaluation> {
     const llmAudit = await params.auditor.auditChapter(
       params.bookDir,
@@ -2662,27 +2699,40 @@ ${matrix}`,
       ...aiTells.issues,
       ...sensitiveResult.issues,
       ...longSpanFatigue.issues,
+      ...(params.extraIssues ?? []),
     ];
-    // revisionBlockingIssues excludes long-span-fatigue issues by
-    // construction (not by category name) so that an LLM-reported issue
-    // sharing a category label with a long-span issue is still counted.
-    const revisionBlockingIssues: ReadonlyArray<AuditIssue> = [
+    // repairIssues excludes long-span-fatigue issues by construction
+    // (not by category name) so that an LLM-reported issue sharing a
+    // category label with a long-span issue is still counted.
+    const repairIssues: ReadonlyArray<AuditIssue> = [
       ...llmAudit.issues,
       ...aiTells.issues,
       ...sensitiveResult.issues,
+      ...(params.extraIssues ?? []),
     ];
+    const blockingCount = repairIssues.filter((issue) => issue.severity === "warning" || issue.severity === "critical").length;
+    const aiTellCount = aiTells.issues.length;
+    const criticalCount = repairIssues.filter((issue) => issue.severity === "critical").length;
+    const passed = (hasBlockedWords || (params.extraIssues?.length ?? 0) > 0) ? false : llmAudit.passed;
+    const repairDecision = this.deriveRepairDecision({
+      passed,
+      llmIssues: llmAudit.issues,
+      blockingCount,
+      aiTellCount,
+    });
 
     return {
       auditResult: {
-        passed: hasBlockedWords ? false : llmAudit.passed,
+        passed,
         issues,
         summary: llmAudit.summary,
         tokenUsage: llmAudit.tokenUsage,
       },
-      aiTellCount: aiTells.issues.length,
-      blockingCount: revisionBlockingIssues.filter((issue) => issue.severity === "warning" || issue.severity === "critical").length,
-      criticalCount: revisionBlockingIssues.filter((issue) => issue.severity === "critical").length,
-      revisionBlockingIssues,
+      aiTellCount,
+      blockingCount,
+      criticalCount,
+      repairIssues,
+      repairDecision,
     };
   }
 

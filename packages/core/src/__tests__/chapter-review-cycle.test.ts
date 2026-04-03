@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { runChapterReviewCycle } from "../pipeline/chapter-review-cycle.js";
+import { runChapterReviewCycle, type ChapterAssessment } from "../pipeline/chapter-review-cycle.js";
 import type { AuditResult, AuditIssue } from "../agents/continuity.js";
 import type { LengthSpec } from "../models/length-governance.js";
 
@@ -28,12 +28,47 @@ function createAuditResult(overrides?: Partial<AuditResult>): AuditResult {
   };
 }
 
+function createAssessment(overrides?: Partial<ChapterAssessment>): ChapterAssessment {
+  return {
+    auditResult: createAuditResult(),
+    repairIssues: [],
+    repairDecision: "none",
+    aiTellCount: 0,
+    blockingCount: 0,
+    criticalCount: 0,
+    ...overrides,
+  };
+}
+
 describe("runChapterReviewCycle", () => {
-  it("applies post-write local fix before the first audit pass", async () => {
-    const auditChapter = vi.fn()
-      .mockResolvedValue(createAuditResult());
+  it("lets the initial assessment choose rewrite instead of forcing local-fix", async () => {
+    const initialRepairIssues: AuditIssue[] = [{
+      severity: "critical",
+      category: "paragraph-shape",
+      description: "too fragmented",
+      suggestion: "merge short fragments",
+    }];
+    const assessChapter = vi.fn()
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: false,
+          issues: initialRepairIssues,
+          summary: "rewrite directly",
+        }),
+        repairIssues: initialRepairIssues,
+        repairDecision: "rewrite",
+        blockingCount: 1,
+        criticalCount: 1,
+      }))
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: true,
+          issues: [],
+          summary: "clean",
+        }),
+      }));
     const reviseChapter = vi.fn().mockResolvedValue({
-      revisedContent: "fixed draft",
+      revisedContent: "rewritten draft",
       wordCount: 10,
       fixedIssues: ["fixed"],
       updatedState: "",
@@ -42,35 +77,29 @@ describe("runChapterReviewCycle", () => {
       tokenUsage: ZERO_USAGE,
     });
     const normalizeDraftLengthIfNeeded = vi.fn()
-      .mockResolvedValue({
-        content: "fixed draft",
+      .mockResolvedValueOnce({
+        content: "raw draft",
+        wordCount: 9,
+        applied: false,
+        tokenUsage: ZERO_USAGE,
+      })
+      .mockResolvedValueOnce({
+        content: "rewritten draft",
         wordCount: 10,
         applied: false,
         tokenUsage: ZERO_USAGE,
       });
 
     const result = await runChapterReviewCycle({
-      book: { genre: "xuanhuan" },
-      bookDir: "/tmp/book",
-      chapterNumber: 1,
-      initialOutput: {
-        content: "raw draft",
-        wordCount: 9,
-        postWriteErrors: [{
-          rule: "paragraph-shape",
-          description: "too fragmented",
-          suggestion: "merge short fragments",
-          severity: "error",
-        }],
-      },
+      initialOutput: { content: "raw draft", wordCount: 9 },
+      initialRepairIssues,
       lengthSpec: LENGTH_SPEC,
-      reducedControlInput: undefined,
       initialUsage: ZERO_USAGE,
+      assessChapter,
       repairChapter: (chapterContent, issues, mode) =>
         reviseChapter("/tmp/book", chapterContent, 1, issues, mode, "xuanhuan", {
           lengthSpec: LENGTH_SPEC,
         }),
-      auditor: { auditChapter },
       normalizeDraftLengthIfNeeded,
       assertChapterContentNotEmpty: () => undefined,
       addUsage: (left, right) => ({
@@ -78,40 +107,72 @@ describe("runChapterReviewCycle", () => {
         completionTokens: left.completionTokens + (right?.completionTokens ?? 0),
         totalTokens: left.totalTokens + (right?.totalTokens ?? 0),
       }),
-      restoreLostAuditIssues: (_previous, next) => next,
-      analyzeAITells: () => ({ issues: [] as AuditIssue[] }),
-      analyzeSensitiveWords: () => ({ found: [] as Array<{ severity: "warn" | "block" }>, issues: [] as AuditIssue[] }),
+      restoreAssessment: (_previous, next) => next,
       logWarn: () => undefined,
       logStage: () => undefined,
     });
 
     expect(reviseChapter).toHaveBeenCalledTimes(1);
-    expect(auditChapter).toHaveBeenCalledTimes(1);
-    expect(auditChapter).toHaveBeenCalledWith(
+    expect(reviseChapter).toHaveBeenCalledWith(
       "/tmp/book",
-      "fixed draft",
+      "raw draft",
       1,
+      initialRepairIssues,
+      "rewrite",
       "xuanhuan",
-      undefined,
+      expect.any(Object),
     );
-    expect(result.finalContent).toBe("fixed draft");
+    expect(assessChapter).toHaveBeenNthCalledWith(1, "raw draft", {
+      initialRepairIssues,
+    });
+    expect(result.finalContent).toBe("rewritten draft");
     expect(result.revised).toBe(true);
   });
 
   it("drops auto-revision when it increases AI tells and re-audits the original draft", async () => {
-    const failingAudit = createAuditResult({
-      passed: false,
-      issues: [{
-        severity: "critical",
-        category: "continuity",
-        description: "broken continuity",
-        suggestion: "fix it",
-      }],
-      summary: "bad",
-    });
-    const auditChapter = vi.fn()
-      .mockResolvedValueOnce(failingAudit)
-      .mockResolvedValueOnce(createAuditResult());
+    const failingIssues: AuditIssue[] = [{
+      severity: "warning",
+      category: "continuity",
+      description: "broken continuity",
+      suggestion: "fix it",
+    }];
+    const assessChapter = vi.fn()
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: false,
+          issues: failingIssues,
+          summary: "bad",
+        }),
+        repairIssues: failingIssues,
+        repairDecision: "local-fix",
+        blockingCount: 1,
+        criticalCount: 0,
+        aiTellCount: 0,
+      }))
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: false,
+          issues: failingIssues,
+          summary: "still noisy",
+        }),
+        repairIssues: failingIssues,
+        repairDecision: "local-fix",
+        blockingCount: 1,
+        criticalCount: 0,
+        aiTellCount: 1,
+      }))
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: false,
+          issues: failingIssues,
+          summary: "fallback original",
+        }),
+        repairIssues: failingIssues,
+        repairDecision: "local-fix",
+        blockingCount: 1,
+        criticalCount: 0,
+        aiTellCount: 0,
+      }));
     const reviseChapter = vi.fn().mockResolvedValue({
       revisedContent: "rewritten draft",
       wordCount: 15,
@@ -141,22 +202,18 @@ describe("runChapterReviewCycle", () => {
     }));
 
     const result = await runChapterReviewCycle({
-      book: { genre: "xuanhuan" },
-      bookDir: "/tmp/book",
-      chapterNumber: 1,
       initialOutput: {
         content: "original draft",
         wordCount: 13,
-        postWriteErrors: [],
       },
+      initialRepairIssues: [],
       lengthSpec: LENGTH_SPEC,
-      reducedControlInput: undefined,
       initialUsage: ZERO_USAGE,
+      assessChapter,
       repairChapter: (chapterContent, issues, mode) =>
         reviseChapter("/tmp/book", chapterContent, 1, issues, mode, "xuanhuan", {
           lengthSpec: LENGTH_SPEC,
         }),
-      auditor: { auditChapter },
       normalizeDraftLengthIfNeeded,
       assertChapterContentNotEmpty: () => undefined,
       addUsage: (left, right) => ({
@@ -164,40 +221,62 @@ describe("runChapterReviewCycle", () => {
         completionTokens: left.completionTokens + (right?.completionTokens ?? 0),
         totalTokens: left.totalTokens + (right?.totalTokens ?? 0),
       }),
-      restoreLostAuditIssues: (_previous, next) => next,
-      analyzeAITells,
-      analyzeSensitiveWords: () => ({ found: [] as Array<{ severity: "warn" | "block" }>, issues: [] as AuditIssue[] }),
+      restoreAssessment: (_previous, next) => next,
       logWarn: () => undefined,
       logStage: () => undefined,
     });
 
     expect(reviseChapter).toHaveBeenCalledTimes(1);
-    expect(auditChapter).toHaveBeenNthCalledWith(1, "/tmp/book", "original draft", 1, "xuanhuan", undefined);
-    expect(auditChapter).toHaveBeenNthCalledWith(2, "/tmp/book", "original draft", 1, "xuanhuan", { temperature: 0 });
+    expect(assessChapter).toHaveBeenNthCalledWith(1, "original draft", { initialRepairIssues: [] });
+    expect(assessChapter).toHaveBeenNthCalledWith(2, "rewritten draft", { temperature: 0 });
+    expect(assessChapter).toHaveBeenNthCalledWith(3, "original draft", { temperature: 0 });
     expect(result.finalContent).toBe("original draft");
     expect(result.revised).toBe(false);
   });
 
-  it("escalates from local fix to full rewrite when the repaired chapter still fails audit", async () => {
-    const failingAudit = createAuditResult({
-      passed: false,
-      issues: [{
-        severity: "critical",
-        category: "continuity",
-        description: "chapter still breaks continuity",
-        suggestion: "rewrite the scene flow",
-      }],
-      summary: "bad",
-    });
-    const passingAudit = createAuditResult({
-      passed: true,
-      issues: [],
-      summary: "clean",
-    });
-    const auditChapter = vi.fn()
-      .mockResolvedValueOnce(failingAudit)
-      .mockResolvedValueOnce(failingAudit)
-      .mockResolvedValueOnce(passingAudit);
+  it("follows fresh repair decisions from each assessment round", async () => {
+    const firstIssues: AuditIssue[] = [{
+      severity: "warning",
+      category: "dialogue",
+      description: "line reads flat",
+      suggestion: "tighten the exchange",
+    }];
+    const secondIssues: AuditIssue[] = [{
+      severity: "critical",
+      category: "continuity",
+      description: "chapter still breaks continuity",
+      suggestion: "rewrite the scene flow",
+    }];
+    const assessChapter = vi.fn()
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: false,
+          issues: firstIssues,
+          summary: "needs local repair",
+        }),
+        repairIssues: firstIssues,
+        repairDecision: "local-fix",
+        blockingCount: 1,
+        criticalCount: 0,
+      }))
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: false,
+          issues: secondIssues,
+          summary: "rewrite now",
+        }),
+        repairIssues: secondIssues,
+        repairDecision: "rewrite",
+        blockingCount: 1,
+        criticalCount: 1,
+      }))
+      .mockResolvedValueOnce(createAssessment({
+        auditResult: createAuditResult({
+          passed: true,
+          issues: [],
+          summary: "clean",
+        }),
+      }));
     const reviseChapter = vi.fn()
       .mockResolvedValueOnce({
         revisedContent: "locally fixed draft",
@@ -238,22 +317,15 @@ describe("runChapterReviewCycle", () => {
       });
 
     const result = await runChapterReviewCycle({
-      book: { genre: "xuanhuan" },
-      bookDir: "/tmp/book",
-      chapterNumber: 1,
-      initialOutput: {
-        content: "original draft",
-        wordCount: 13,
-        postWriteErrors: [],
-      },
+      initialOutput: { content: "original draft", wordCount: 13 },
+      initialRepairIssues: [],
       lengthSpec: LENGTH_SPEC,
-      reducedControlInput: undefined,
       initialUsage: ZERO_USAGE,
+      assessChapter,
       repairChapter: (chapterContent, issues, mode) =>
         reviseChapter("/tmp/book", chapterContent, 1, issues, mode, "xuanhuan", {
           lengthSpec: LENGTH_SPEC,
         }),
-      auditor: { auditChapter },
       normalizeDraftLengthIfNeeded,
       assertChapterContentNotEmpty: () => undefined,
       addUsage: (left, right) => ({
@@ -261,9 +333,7 @@ describe("runChapterReviewCycle", () => {
         completionTokens: left.completionTokens + (right?.completionTokens ?? 0),
         totalTokens: left.totalTokens + (right?.totalTokens ?? 0),
       }),
-      restoreLostAuditIssues: (_previous, next) => next,
-      analyzeAITells: () => ({ issues: [] as AuditIssue[] }),
-      analyzeSensitiveWords: () => ({ found: [] as Array<{ severity: "warn" | "block" }>, issues: [] as AuditIssue[] }),
+      restoreAssessment: (_previous, next) => next,
       logWarn: () => undefined,
       logStage: () => undefined,
     });
@@ -273,7 +343,7 @@ describe("runChapterReviewCycle", () => {
       "/tmp/book",
       "original draft",
       1,
-      failingAudit.issues,
+      firstIssues,
       "local-fix",
       "xuanhuan",
       expect.any(Object),
@@ -283,14 +353,14 @@ describe("runChapterReviewCycle", () => {
       "/tmp/book",
       "locally fixed draft",
       1,
-      failingAudit.issues,
+      secondIssues,
       "rewrite",
       "xuanhuan",
       expect.any(Object),
     );
-    expect(auditChapter).toHaveBeenNthCalledWith(1, "/tmp/book", "original draft", 1, "xuanhuan", undefined);
-    expect(auditChapter).toHaveBeenNthCalledWith(2, "/tmp/book", "locally fixed draft", 1, "xuanhuan", { temperature: 0 });
-    expect(auditChapter).toHaveBeenNthCalledWith(3, "/tmp/book", "fully rewritten draft", 1, "xuanhuan", { temperature: 0 });
+    expect(assessChapter).toHaveBeenNthCalledWith(1, "original draft", { initialRepairIssues: [] });
+    expect(assessChapter).toHaveBeenNthCalledWith(2, "locally fixed draft", { temperature: 0 });
+    expect(assessChapter).toHaveBeenNthCalledWith(3, "fully rewritten draft", { temperature: 0 });
     expect(result.finalContent).toBe("fully rewritten draft");
     expect(result.revised).toBe(true);
     expect(result.auditResult.passed).toBe(true);

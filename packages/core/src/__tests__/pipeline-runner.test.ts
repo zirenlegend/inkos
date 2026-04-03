@@ -1861,6 +1861,12 @@ describe("PipelineRunner", () => {
 
   it("uses the latest revised content as the input for follow-up local-fix revisions", async () => {
     const { root, runner, bookId } = await createRunnerFixture();
+    const localIssue: AuditIssue = {
+      severity: "warning",
+      category: "continuity",
+      description: "Needs a tighter local correction",
+      suggestion: "Repair the line",
+    };
 
     vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
       createWriterOutput({
@@ -1879,8 +1885,13 @@ describe("PipelineRunner", () => {
     vi.spyOn(ContinuityAuditor.prototype, "auditChapter")
       .mockResolvedValueOnce(createAuditResult({
         passed: false,
-        issues: [CRITICAL_ISSUE],
-        summary: "needs another revision",
+        issues: [localIssue],
+        summary: "needs another local revision",
+      }))
+      .mockResolvedValueOnce(createAuditResult({
+        passed: false,
+        issues: [localIssue],
+        summary: "still local",
       }))
       .mockResolvedValueOnce(createAuditResult({
         passed: true,

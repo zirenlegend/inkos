@@ -1,7 +1,6 @@
 import type { AuditIssue, AuditResult } from "../agents/continuity.js";
 import type { ReviseOutput } from "../agents/reviser.js";
 import type { WriteChapterOutput } from "../agents/writer.js";
-import type { ContextPackage, RuleStack } from "../models/input-governance.js";
 import type { LengthSpec } from "../models/length-governance.js";
 
 export interface ChapterReviewCycleUsage {
@@ -10,10 +9,15 @@ export interface ChapterReviewCycleUsage {
   readonly totalTokens: number;
 }
 
-export interface ChapterReviewCycleControlInput {
-  readonly chapterIntent: string;
-  readonly contextPackage: ContextPackage;
-  readonly ruleStack: RuleStack;
+export type ChapterRepairDecision = "none" | "local-fix" | "rewrite";
+
+export interface ChapterAssessment {
+  readonly auditResult: AuditResult;
+  readonly repairIssues: ReadonlyArray<AuditIssue>;
+  readonly repairDecision: ChapterRepairDecision;
+  readonly aiTellCount: number;
+  readonly blockingCount: number;
+  readonly criticalCount: number;
 }
 
 export interface ChapterReviewCycleResult {
@@ -28,32 +32,22 @@ export interface ChapterReviewCycleResult {
 }
 
 export async function runChapterReviewCycle(params: {
-  readonly book: Pick<{ genre: string }, "genre">;
-  readonly bookDir: string;
-  readonly chapterNumber: number;
-  readonly initialOutput: Pick<WriteChapterOutput, "content" | "wordCount" | "postWriteErrors">;
-  readonly reducedControlInput?: ChapterReviewCycleControlInput;
+  readonly initialOutput: Pick<WriteChapterOutput, "content" | "wordCount">;
+  readonly initialRepairIssues?: ReadonlyArray<AuditIssue>;
   readonly lengthSpec: LengthSpec;
   readonly initialUsage: ChapterReviewCycleUsage;
+  readonly assessChapter: (
+    chapterContent: string,
+    options?: {
+      temperature?: number;
+      initialRepairIssues?: ReadonlyArray<AuditIssue>;
+    },
+  ) => Promise<ChapterAssessment>;
   readonly repairChapter: (
     chapterContent: string,
     issues: ReadonlyArray<AuditIssue>,
-    mode: "local-fix" | "rewrite",
+    mode: Exclude<ChapterRepairDecision, "none">,
   ) => Promise<ReviseOutput>;
-  readonly auditor: {
-    auditChapter: (
-      bookDir: string,
-      chapterContent: string,
-      chapterNumber: number,
-      genre?: string,
-      options?: {
-        temperature?: number;
-        chapterIntent?: string;
-        contextPackage?: ContextPackage;
-        ruleStack?: RuleStack;
-      },
-    ) => Promise<AuditResult>;
-  };
   readonly normalizeDraftLengthIfNeeded: (chapterContent: string) => Promise<{
     content: string;
     wordCount: number;
@@ -65,38 +59,23 @@ export async function runChapterReviewCycle(params: {
     left: ChapterReviewCycleUsage,
     right?: ChapterReviewCycleUsage,
   ) => ChapterReviewCycleUsage;
-  readonly restoreLostAuditIssues: (previous: AuditResult, next: AuditResult) => AuditResult;
-  readonly analyzeAITells: (content: string) => { issues: ReadonlyArray<AuditIssue> };
-  readonly analyzeSensitiveWords: (content: string) => {
-    found: ReadonlyArray<{ severity: string }>;
-    issues: ReadonlyArray<AuditIssue>;
-  };
+  readonly restoreAssessment: (
+    previous: ChapterAssessment,
+    next: ChapterAssessment,
+  ) => ChapterAssessment;
   readonly logWarn: (message: { zh: string; en: string }) => void;
   readonly logStage: (message: { zh: string; en: string }) => void;
 }): Promise<ChapterReviewCycleResult> {
-  const evaluateChapter = async (
+  const assess = async (
     chapterContent: string,
-    temperature?: number,
-  ): Promise<AuditResult> => {
-    const llmAudit = await params.auditor.auditChapter(
-      params.bookDir,
-      chapterContent,
-      params.chapterNumber,
-      params.book.genre,
-      params.reducedControlInput
-        ? { ...params.reducedControlInput, ...(temperature !== undefined ? { temperature } : {}) }
-        : (temperature !== undefined ? { temperature } : undefined),
-    );
-    totalUsage = params.addUsage(totalUsage, llmAudit.tokenUsage);
-    const aiTellsResult = params.analyzeAITells(chapterContent);
-    const sensitiveWriteResult = params.analyzeSensitiveWords(chapterContent);
-    const hasBlockedWriteWords = sensitiveWriteResult.found.some((item) => item.severity === "block");
-
-    return {
-      passed: hasBlockedWriteWords ? false : llmAudit.passed,
-      issues: [...llmAudit.issues, ...aiTellsResult.issues, ...sensitiveWriteResult.issues],
-      summary: llmAudit.summary,
-    };
+    options?: {
+      temperature?: number;
+      initialRepairIssues?: ReadonlyArray<AuditIssue>;
+    },
+  ): Promise<ChapterAssessment> => {
+    const assessment = await params.assessChapter(chapterContent, options);
+    totalUsage = params.addUsage(totalUsage, assessment.auditResult.tokenUsage);
+    return assessment;
   };
 
   let totalUsage = params.initialUsage;
@@ -106,30 +85,6 @@ export async function runChapterReviewCycle(params: {
   let finalWordCount = params.initialOutput.wordCount;
   let revised = false;
 
-  if (params.initialOutput.postWriteErrors.length > 0) {
-    params.logWarn({
-      zh: `检测到 ${params.initialOutput.postWriteErrors.length} 个后写错误，审计前触发局部修复`,
-      en: `${params.initialOutput.postWriteErrors.length} post-write errors detected, triggering local repair before audit`,
-    });
-    const spotFixIssues = params.initialOutput.postWriteErrors.map((violation) => ({
-      severity: "critical" as const,
-      category: violation.rule,
-      description: violation.description,
-      suggestion: violation.suggestion,
-    }));
-    const fixResult = await params.repairChapter(
-      finalContent,
-      spotFixIssues,
-      "local-fix",
-    );
-    totalUsage = params.addUsage(totalUsage, fixResult.tokenUsage);
-    if (fixResult.revisedContent.length > 0) {
-      finalContent = fixResult.revisedContent;
-      finalWordCount = fixResult.wordCount;
-      revised = true;
-    }
-  }
-
   const normalizedBeforeAudit = await params.normalizeDraftLengthIfNeeded(finalContent);
   totalUsage = params.addUsage(totalUsage, normalizedBeforeAudit.tokenUsage);
   finalContent = normalizedBeforeAudit.content;
@@ -137,15 +92,20 @@ export async function runChapterReviewCycle(params: {
   normalizeApplied = normalizeApplied || normalizedBeforeAudit.applied;
   params.assertChapterContentNotEmpty(finalContent, "draft generation");
 
+  if ((params.initialRepairIssues?.length ?? 0) > 0) {
+    params.logWarn({
+      zh: `首轮评审接收了 ${params.initialRepairIssues!.length} 条预检修复问题`,
+      en: `${params.initialRepairIssues!.length} preflight repair issues were fed into the first assessment`,
+    });
+  }
+
   params.logStage({ zh: "审计草稿", en: "auditing draft" });
-  let auditResult = await evaluateChapter(finalContent);
+  let assessment = await assess(finalContent, {
+    initialRepairIssues: params.initialRepairIssues ?? [],
+  });
 
-  const repairModes = ["local-fix", "rewrite"] as const;
-  for (const repairMode of repairModes) {
-    if (auditResult.passed || auditResult.issues.length === 0) {
-      break;
-    }
-
+  while (assessment.repairDecision !== "none" && assessment.repairIssues.length > 0) {
+    const repairMode = assessment.repairDecision;
     params.logStage(
       repairMode === "local-fix"
         ? { zh: "自动修复当前章的局部问题", en: "auto-fixing local issues in the current chapter" }
@@ -153,7 +113,7 @@ export async function runChapterReviewCycle(params: {
     );
     const reviseOutput = await params.repairChapter(
       finalContent,
-      auditResult.issues,
+      assessment.repairIssues,
       repairMode,
     );
     totalUsage = params.addUsage(totalUsage, reviseOutput.tokenUsage);
@@ -169,12 +129,18 @@ export async function runChapterReviewCycle(params: {
     totalUsage = params.addUsage(totalUsage, normalizedRevision.tokenUsage);
     postReviseCount = normalizedRevision.wordCount;
     normalizeApplied = normalizeApplied || normalizedRevision.applied;
+    const previousAssessment = assessment;
+    const previousContent = finalContent;
 
-    const preMarkers = params.analyzeAITells(finalContent);
-    const postMarkers = params.analyzeAITells(normalizedRevision.content);
-    if (postMarkers.issues.length > preMarkers.issues.length) {
-      const rejectedAudit = await evaluateChapter(finalContent, 0);
-      auditResult = params.restoreLostAuditIssues(auditResult, rejectedAudit);
+    const nextAssessment = params.restoreAssessment(
+      previousAssessment,
+      await assess(normalizedRevision.content, { temperature: 0 }),
+    );
+    if (nextAssessment.aiTellCount > previousAssessment.aiTellCount) {
+      assessment = params.restoreAssessment(
+        previousAssessment,
+        await assess(previousContent, { temperature: 0 }),
+      );
       break;
     }
 
@@ -182,9 +148,7 @@ export async function runChapterReviewCycle(params: {
     finalWordCount = normalizedRevision.wordCount;
     revised = true;
     params.assertChapterContentNotEmpty(finalContent, repairMode === "local-fix" ? "revision" : "rewrite");
-
-    const nextAudit = await evaluateChapter(finalContent, 0);
-    auditResult = params.restoreLostAuditIssues(auditResult, nextAudit);
+    assessment = nextAssessment;
   }
 
   return {
@@ -192,7 +156,7 @@ export async function runChapterReviewCycle(params: {
     finalWordCount,
     preAuditNormalizedWordCount: normalizedBeforeAudit.wordCount,
     revised,
-    auditResult,
+    auditResult: assessment.auditResult,
     totalUsage,
     postReviseCount,
     normalizeApplied,
